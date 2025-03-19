@@ -15,7 +15,6 @@ use std::{
     convert::{TryFrom, TryInto},
     sync::{Arc, Mutex},
 };
-
 use serde_json::json;
 use tracing::{error, trace};
 use zenoh_buffers::buffer::SplitBuffer;
@@ -49,6 +48,7 @@ use crate::{
     bytes::Encoding,
     net::primitives::Primitives,
 };
+use crate::net::routing::interceptor::downsampling::DSM;
 
 pub struct AdminContext {
     runtime: Runtime,
@@ -240,6 +240,26 @@ impl AdminSpace {
         });
 
         config.set_plugin_validator(Arc::downgrade(&admin));
+
+        let cfg_downsampling = admin.context.runtime.state.config.subscribe();
+        tokio::spawn({
+                               let admin = admin.clone();
+                               async move {
+                                   while let Ok(change) = cfg_downsampling.recv_async().await {
+                                       let change = change.strip_prefix('/').unwrap_or(&change);
+                                       if change.starts_with("downsampling") {
+                                           let conf = admin.context.runtime.state.config.lock();
+                                           let downsample_conf = conf.downsampling();
+                                           tracing::debug!(
+                                               "Config Change `{}`",
+                                               downsample_conf.first().unwrap().rules.first().unwrap().freq
+                                           );
+
+                                           DSM.0.send(downsample_conf.first().unwrap().clone()).unwrap();
+                                       }
+                                   }
+                               }
+        });
 
         #[cfg(all(feature = "plugins", feature = "runtime_plugins"))]
         {
@@ -502,10 +522,6 @@ impl Primitives for AdminSpace {
 
     fn send_close(&self) {
         trace!("recv Close");
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 

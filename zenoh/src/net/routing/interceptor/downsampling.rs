@@ -22,18 +22,22 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
-
-use zenoh_config::{
-    DownsamplingItemConf, DownsamplingMessage, DownsamplingRuleConf, InterceptorFlow,
-};
+use tracing::trace;
+use zenoh_config::{DownsamplingItemConf, DownsamplingRuleConf, InterceptorFlow};
 use zenoh_core::zlock;
 use zenoh_keyexpr::keyexpr_tree::{
     impls::KeyedSetProvider, support::UnknownWildness, IKeyExprTree, IKeyExprTreeMut, KeBoxTree,
 };
 use zenoh_protocol::network::NetworkBody;
 use zenoh_result::ZResult;
-
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::task::JoinHandle;
 use crate::net::routing::interceptor::*;
+
+lazy_static! {
+    pub static ref DSM: Arc<(Sender<DownsamplingItemConf>, Receiver<DownsamplingItemConf>)> = Arc::new(broadcast::channel(256));
+}
 
 pub(crate) fn downsampling_interceptor_factories(
     config: &Vec<DownsamplingItemConf>,
@@ -48,19 +52,7 @@ pub(crate) fn downsampling_interceptor_factories(
                 bail!("Invalid Downsampling config: id '{id}' is repeated");
             }
         }
-        let mut ds = ds.clone();
-        // check for undefined flows and initialize them
-        let flows = ds
-            .flows
-            .get_or_insert(vec![InterceptorFlow::Ingress, InterceptorFlow::Egress]);
-        if flows.is_empty() {
-            bail!("Invalid Downsampling config: flows list must not be empty");
-        }
-        // check for empty messages list
-        if ds.messages.is_empty() {
-            bail!("Invalid Downsampling config: messages list must not be empty");
-        }
-        res.push(Box::new(DownsamplingInterceptorFactory::new(ds)));
+        res.push(Box::new(DownsamplingInterceptorFactory::new(ds.clone())));
     }
 
     Ok(res)
@@ -69,8 +61,7 @@ pub(crate) fn downsampling_interceptor_factories(
 pub struct DownsamplingInterceptorFactory {
     interfaces: Option<Vec<String>>,
     rules: Vec<DownsamplingRuleConf>,
-    flows: InterfaceEnabled,
-    messages: Arc<DownsamplingFilters>,
+    flow: InterceptorFlow,
 }
 
 impl DownsamplingInterceptorFactory {
@@ -78,12 +69,7 @@ impl DownsamplingInterceptorFactory {
         Self {
             interfaces: conf.interfaces,
             rules: conf.rules,
-            flows: conf
-                .flows
-                .expect("config flows should be set")
-                .as_slice()
-                .into(),
-            messages: Arc::new(conf.messages.as_slice().into()),
+            flow: conf.flow,
         }
     }
 }
@@ -111,20 +97,20 @@ impl InterceptorFactoryTrait for DownsamplingInterceptorFactory {
                 }
             }
         };
-        (
-            self.flows.ingress.then(|| {
-                Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
-                    self.messages.clone(),
+        match self.flow {
+            InterceptorFlow::Ingress => (
+                Some(Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
                     self.rules.clone(),
-                ))) as IngressInterceptor
-            }),
-            self.flows.egress.then(|| {
-                Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
-                    self.messages.clone(),
+                )))),
+                None,
+            ),
+            InterceptorFlow::Egress => (
+                None,
+                Some(Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
                     self.rules.clone(),
-                ))) as EgressInterceptor
-            }),
-        )
+                )))),
+            ),
+        }
     }
 
     fn new_transport_multicast(
@@ -139,49 +125,21 @@ impl InterceptorFactoryTrait for DownsamplingInterceptorFactory {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct DownsamplingFilters {
-    push: bool,
-    query: bool,
-    reply: bool,
-}
-
-impl From<&[DownsamplingMessage]> for DownsamplingFilters {
-    fn from(value: &[DownsamplingMessage]) -> Self {
-        let mut res = Self::default();
-        for v in value {
-            match v {
-                DownsamplingMessage::Push => res.push = true,
-                DownsamplingMessage::Query => res.query = true,
-                DownsamplingMessage::Reply => res.reply = true,
-            }
-        }
-        res
-    }
-}
-
-struct Timestate {
-    pub threshold: tokio::time::Duration,
-    pub latest_message_timestamp: tokio::time::Instant,
+pub struct Timestate {
+    threshold: tokio::time::Duration,
+    latest_message_timestamp: tokio::time::Instant,
 }
 
 pub(crate) struct DownsamplingInterceptor {
-    filtered_messages: Arc<DownsamplingFilters>,
     ke_id: Arc<Mutex<KeBoxTree<usize, UnknownWildness, KeyedSetProvider>>>,
     ke_state: Arc<Mutex<HashMap<usize, Timestate>>>,
+    handle: Option<JoinHandle<()>>
 }
 
-impl DownsamplingInterceptor {
-    fn is_msg_filtered(&self, ctx: &RoutingContext<NetworkMessage>) -> bool {
-        match ctx.msg.body {
-            NetworkBody::Push(_) => self.filtered_messages.push,
-            NetworkBody::Request(_) => self.filtered_messages.query,
-            NetworkBody::Response(_) => self.filtered_messages.reply,
-            NetworkBody::ResponseFinal(_) => false,
-            NetworkBody::Interest(_) => false,
-            NetworkBody::Declare(_) => false,
-            NetworkBody::OAM(_) => false,
-        }
+impl Drop for DownsamplingInterceptor {
+    fn drop(&mut self) {
+        tracing::debug!("DownSampling Interceptor dropped. Removeing task.");
+        self.handle.take().unwrap().abort();
     }
 }
 
@@ -201,7 +159,7 @@ impl InterceptorTrait for DownsamplingInterceptor {
         ctx: RoutingContext<NetworkMessage>,
         cache: Option<&Box<dyn Any + Send + Sync>>,
     ) -> Option<RoutingContext<NetworkMessage>> {
-        if self.is_msg_filtered(&ctx) {
+        if matches!(ctx.msg.body, NetworkBody::Push(_)) {
             if let Some(cache) = cache {
                 if let Some(id) = cache.downcast_ref::<Option<usize>>() {
                     if let Some(id) = id {
@@ -232,36 +190,54 @@ impl InterceptorTrait for DownsamplingInterceptor {
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
 impl DownsamplingInterceptor {
-    pub fn new(messages: Arc<DownsamplingFilters>, rules: Vec<DownsamplingRuleConf>) -> Self {
-        let mut ke_id = KeBoxTree::default();
-        let mut ke_state = HashMap::default();
+    pub fn new(rules: Vec<DownsamplingRuleConf>) -> Self {
+        let ke_id = Arc::new(Mutex::new(KeBoxTree::default()));
+        let ke_state = Arc::new(Mutex::new(HashMap::default()));
         for (id, rule) in rules.into_iter().enumerate() {
-            let mut threshold = tokio::time::Duration::MAX;
-            let mut latest_message_timestamp = tokio::time::Instant::now();
-            if rule.freq != 0.0 {
-                threshold =
-                    tokio::time::Duration::from_nanos((1. / rule.freq * NANOS_PER_SEC) as u64);
-                latest_message_timestamp -= threshold;
+           Self::update_downsampling_rule(&ke_id, &ke_state, id, &rule);
+        }
+
+        let dsm = DSM.clone();
+        let ke_i = ke_id.clone();
+        let ke_s = ke_state.clone();
+        let handle = Some(tokio::spawn(async move {
+            loop {
+                let conf = dsm.0.subscribe().recv().await.unwrap();
+                tracing::debug!("Trying to update DownSamplerInteceptor with new config ...");
+                let rules = conf.rules;
+                for (id, rule) in rules.into_iter().enumerate() {
+                    Self::update_downsampling_rule(&ke_i, &ke_s, id, &rule);
+                }
             }
-            ke_id.insert(&rule.key_expr, id);
-            ke_state.insert(
-                id,
-                Timestate {
-                    threshold,
-                    latest_message_timestamp,
-                },
-            );
-            tracing::debug!(
-                "New downsampler rule enabled: key_expr={:?}, threshold={:?}, messages={:?}",
-                rule.key_expr,
-                threshold,
-                messages,
-            );
-        }
+        }));
+
         Self {
-            filtered_messages: messages,
-            ke_id: Arc::new(Mutex::new(ke_id)),
-            ke_state: Arc::new(Mutex::new(ke_state)),
+            ke_id,
+            ke_state,
+            handle
         }
+    }
+
+    fn update_downsampling_rule(ke_id: &Arc<Mutex<KeBoxTree<usize, UnknownWildness>>>, ke_state: &Arc<Mutex<HashMap<usize, Timestate>>>, id: usize, rule: &DownsamplingRuleConf) {
+        let mut threshold = tokio::time::Duration::MAX;
+        let mut latest_message_timestamp = tokio::time::Instant::now();
+        if rule.freq != 0.0 {
+            threshold =
+                tokio::time::Duration::from_nanos((1. / rule.freq * NANOS_PER_SEC) as u64);
+            latest_message_timestamp -= threshold;
+        }
+        ke_id.lock().unwrap().insert(&rule.key_expr, id);
+        ke_state.lock().unwrap().insert(
+            id,
+            Timestate {
+                threshold,
+                latest_message_timestamp,
+            },
+        );
+        tracing::debug!(
+                "New downsampler rule enabled: key_expr={:?}, threshold={:?}",
+                rule.key_expr,
+                threshold
+            );
     }
 }
